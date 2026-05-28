@@ -28,17 +28,57 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
-import geopandas as gpd
-import matplotlib.pyplot as plt
-import numpy as np
-import pandas as pd
-from shapely.geometry import LineString, MultiLineString, Point, Polygon, box
-from shapely.ops import unary_union
-
 try:
     import networkx as nx
 except ImportError:  # pragma: no cover - handled at runtime
     nx = None
+
+gpd = None
+plt = None
+np = None
+pd = None
+LineString = None
+MultiLineString = None
+Point = None
+Polygon = None
+box = None
+unary_union = None
+
+
+def ensure_geospatial_dependencies() -> None:
+    """Import heavy GIS dependencies only when the full analysis is executed."""
+    global gpd, plt, np, pd, LineString, MultiLineString, Point, Polygon, box, unary_union
+    if gpd is not None:
+        return
+    try:
+        import geopandas as _gpd
+        import matplotlib.pyplot as _plt
+        import numpy as _np
+        import pandas as _pd
+        from shapely.geometry import LineString as _LineString
+        from shapely.geometry import MultiLineString as _MultiLineString
+        from shapely.geometry import Point as _Point
+        from shapely.geometry import Polygon as _Polygon
+        from shapely.geometry import box as _box
+        from shapely.ops import unary_union as _unary_union
+    except ImportError as exc:  # pragma: no cover - depends on runtime environment
+        raise ImportError(
+            "The full isochrone analysis requires geopandas, pandas, numpy, "
+            "matplotlib, shapely, and pyogrio/fiona. Install the geospatial "
+            "requirements before running analysis cells, e.g. "
+            "`pip install geopandas pandas numpy matplotlib shapely pyogrio networkx`."
+        ) from exc
+
+    gpd = _gpd
+    plt = _plt
+    np = _np
+    pd = _pd
+    LineString = _LineString
+    MultiLineString = _MultiLineString
+    Point = _Point
+    Polygon = _Polygon
+    box = _box
+    unary_union = _unary_union
 
 
 CRS_WGS84 = "EPSG:4326"
@@ -666,6 +706,7 @@ def run_analysis(args: argparse.Namespace) -> int:
     if args.check_inputs:
         return 0 if check_inputs(data_dir) else 2
 
+    ensure_geospatial_dependencies()
     layers = discover_layers(data_dir)
     if layers["lrt_stops"] is None:
         raise FileNotFoundError("Missing required lrt_stops.shp under data/.")
