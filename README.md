@@ -422,6 +422,24 @@ This layer is optional. The core LRT population, transportation, land price, roa
 
 ## Preliminary Analysis Workflow
 
+### Kiyohara public-transport isochrone workflow
+
+For the Kiyohara industrial-area accessibility request, use:
+
+```bash
+python3 scripts/kiyohara_transit_isochrone.py --check-inputs
+python3 scripts/kiyohara_transit_isochrone.py \
+  --target-stop-regex "清原|工業団地" \
+  --thresholds 30 60
+```
+
+The same workflow is available in `kiyohara_transit_isochrone_analysis.ipynb`.
+It estimates `Z` from cumulative LRT stop-to-stop length at 20 km/h, estimates
+`Y` from the attached N07 bus route line layer (`N07-11_09_GML.shp`) at
+20 km/h when present, and uses remaining time for road-network walking
+isochrones from bus/LRT access nodes. Complete shapefile sidecars must be
+placed under `data/`; the script reports missing inputs before analysis.
+
 ### 1. Load Data and Standardize CRS
 
 Load all shapefiles using GeoPandas and reproject to EPSG:6678.
