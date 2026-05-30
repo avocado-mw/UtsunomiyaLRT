@@ -524,6 +524,7 @@ def add_bus_transfer_edges(
     if snapped_points.empty or radius_m <= 0:
         return 0
     transfer_nodes = snapped_points[["node"]].drop_duplicates().merge(nodes, on="node", how="inner")
+    transfer_nodes = gpd.GeoDataFrame(transfer_nodes, geometry="geometry", crs=CRS_ANALYSIS)
     if transfer_nodes.empty:
         return 0
 
@@ -533,6 +534,7 @@ def add_bus_transfer_edges(
         crs=CRS_ANALYSIS,
     )
     right = transfer_nodes[["node", "geometry"]].rename(columns={"node": "node_right"})
+    right = gpd.GeoDataFrame(right, geometry="geometry", crs=CRS_ANALYSIS)
     pairs = gpd.sjoin(left, right, how="inner", predicate="intersects")
 
     added = 0
