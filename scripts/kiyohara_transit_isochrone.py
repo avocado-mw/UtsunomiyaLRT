@@ -96,12 +96,13 @@ BUS_TARGET_SNAP_MAX_M = 750
 
 DEFAULT_THRESHOLDS = (30, 60)
 DEFAULT_TARGET_STOP_REGEX = r"清原|工業団地"
-EXPECTED_ROAD_MESH_FILES = (
-    "N13-24_5439.shp",
-    "N13-24-5440.shp",
-    "N13-24-5539.shp",
-    "N13-24-5540.shp",
-)
+REQUIRED_ROAD_MESH_IDS = ("5439", "5440", "5539", "5540")
+EXPECTED_ROAD_MESH_FILES = {
+    "5439": "N13-24_5439.shp",
+    "5440": "N13-24-5440.shp",
+    "5539": "N13-24-5539.shp",
+    "5540": "N13-24-5540.shp",
+}
 
 LAYER_PATTERNS = {
     "lrt_stops": [
@@ -196,6 +197,48 @@ def shapefile_sidecars_missing(path: Path) -> list[str]:
     return [path.with_suffix(s).name for s in required if not path.with_suffix(s).exists()]
 
 
+def road_mesh_id(path: Path) -> str | None:
+    match = re.search(r"N13-24[-_](\d{4})\.shp$", path.name, flags=re.IGNORECASE)
+    if not match:
+        return None
+    return match.group(1)
+
+
+def required_road_mesh_errors(road_paths: list[Path]) -> list[str]:
+    by_mesh: dict[str, Path] = {}
+    for path in road_paths:
+        mesh_id = road_mesh_id(path)
+        if mesh_id in REQUIRED_ROAD_MESH_IDS and mesh_id not in by_mesh:
+            by_mesh[mesh_id] = path
+
+    errors: list[str] = []
+    for mesh_id in REQUIRED_ROAD_MESH_IDS:
+        path = by_mesh.get(mesh_id)
+        expected_name = EXPECTED_ROAD_MESH_FILES[mesh_id]
+        if path is None:
+            errors.append(f"roads: missing required N13 mesh {expected_name}")
+            continue
+        missing = shapefile_sidecars_missing(path)
+        if missing:
+            errors.append(f"roads: {path} missing {', '.join(missing)}")
+    return errors
+
+
+def validate_required_inputs(layers: dict[str, Path | list[Path] | None]) -> list[str]:
+    errors: list[str] = []
+    lrt_path = layers.get("lrt_stops")
+    if not isinstance(lrt_path, Path):
+        errors.append("lrt_stops: no matching .shp")
+    else:
+        missing = shapefile_sidecars_missing(lrt_path)
+        if missing:
+            errors.append(f"lrt_stops: missing {', '.join(missing)}")
+
+    road_paths = layers.get("roads") if isinstance(layers.get("roads"), list) else []
+    errors.extend(required_road_mesh_errors(road_paths))
+    return errors
+
+
 def discover_layers(data_dir: Path) -> dict[str, Path | list[Path] | None]:
     layers: dict[str, Path | list[Path] | None] = {}
     for key in LAYER_PATTERNS:
@@ -224,33 +267,18 @@ def discover_layers(data_dir: Path) -> dict[str, Path | list[Path] | None]:
 
 def check_inputs(data_dir: Path) -> bool:
     layers = discover_layers(data_dir)
-    missing_required = []
-    for key in ["lrt_stops"]:
-        path = layers[key]
-        if path is None:
-            missing_required.append(f"{key}: no matching .shp")
-        else:
-            missing = shapefile_sidecars_missing(path)
-            if missing:
-                missing_required.append(f"{key}: missing {', '.join(missing)}")
-
-    if missing_required:
-        log("\nRequired inputs are incomplete:")
-        for item in missing_required:
-            log(f" - {item}")
-        log("\nPlace the complete shapefile set under data/ before running the analysis.")
-        return False
+    input_errors = validate_required_inputs(layers)
 
     if layers["bus_routes"] is None:
         log("\nWARNING: N07 bus route lines were not found. Y minutes will fall back to straight-line distance.")
-    road_paths = layers["roads"] if isinstance(layers["roads"], list) else []
-    if not road_paths:
-        log("\nWARNING: N13 road lines were not found. X minutes will fall back to circular buffers.")
-    else:
-        found_road_names = {path.name for path in road_paths}
-        missing_road_names = [name for name in EXPECTED_ROAD_MESH_FILES if name not in found_road_names]
-        if missing_road_names:
-            log("\nNOTE: Some expected Utsunomiya road mesh files were not found: " + ", ".join(missing_road_names))
+
+    if input_errors:
+        log("\nRequired inputs are incomplete:")
+        for item in input_errors:
+            log(f" - {item}")
+        log("\nPlace the complete shapefile sets under data/ before running the analysis.")
+        return False
+
     return True
 
 
@@ -859,8 +887,10 @@ def run_analysis(args: argparse.Namespace) -> int:
 
     ensure_geospatial_dependencies()
     layers = discover_layers(data_dir)
-    if layers["lrt_stops"] is None:
-        raise FileNotFoundError("Missing required lrt_stops.shp under data/.")
+    input_errors = validate_required_inputs(layers)
+    if input_errors:
+        formatted = "\n - ".join(input_errors)
+        raise FileNotFoundError(f"Required inputs are incomplete:\n - {formatted}")
 
     lrt_stops = read_layer(layers["lrt_stops"])
     bus_stops = read_layer(layers["bus_stops"]) if layers["bus_stops"] else None

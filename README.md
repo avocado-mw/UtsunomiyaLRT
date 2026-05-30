@@ -442,11 +442,11 @@ at 20 km/h when present. The bus network permits additive multi-route travel
 network. Remaining time is used for road-network walking isochrones from
 bus/LRT access nodes.
 
-For road-network walking, the script combines all available Utsunomiya N13
-road mesh shapefiles under `data/`, including `N13-24_5439.shp`,
-`N13-24-5440.shp`, `N13-24-5539.shp`, and `N13-24-5540.shp` when present.
-Complete shapefile sidecars must be placed under `data/`; the script reports
-missing inputs before analysis.
+For road-network walking, the script requires all four Utsunomiya N13 road
+mesh shapefiles before the analysis will run: `N13-24_5439.shp`,
+`N13-24-5440.shp`, `N13-24-5539.shp`, and `N13-24-5540.shp`. Complete
+shapefile sidecars (`.shp`, `.shx`, `.dbf`, and preferably `.prj`) must be
+placed under `data/`; the script reports missing inputs before analysis.
 
 ### 1. Load Data and Standardize CRS
 
