@@ -90,9 +90,18 @@ BUS_SPEED_M_PER_MIN = 20_000 / 60
 WALK_SPEED_M_PER_MIN = 80
 ROAD_DISTANCE_FACTOR = 1.1666
 WALK_CORRIDOR_BUFFER_M = 40
+BUS_TRANSFER_RADIUS_M = 250
+BUS_TRANSFER_PENALTY_MIN = 0.0
+BUS_TARGET_SNAP_MAX_M = 750
 
 DEFAULT_THRESHOLDS = (30, 60)
 DEFAULT_TARGET_STOP_REGEX = r"清原|工業団地"
+EXPECTED_ROAD_MESH_FILES = (
+    "N13-24_5439.shp",
+    "N13-24-5440.shp",
+    "N13-24-5539.shp",
+    "N13-24-5540.shp",
+)
 
 LAYER_PATTERNS = {
     "lrt_stops": [
@@ -115,6 +124,13 @@ LAYER_PATTERNS = {
     ],
     "roads": [
         "N13-24_5439.shp",
+        "N13-24-5439.shp",
+        "N13-24_5440.shp",
+        "N13-24-5440.shp",
+        "N13-24_5539.shp",
+        "N13-24-5539.shp",
+        "N13-24_5540.shp",
+        "N13-24-5540.shp",
         "N13*.shp",
         "*road*.shp",
         "*道路*.shp",
@@ -155,7 +171,7 @@ def log(message: str) -> None:
     print(message, flush=True)
 
 
-def find_layer(data_dir: Path, key: str) -> Path | None:
+def find_layers(data_dir: Path, key: str) -> list[Path]:
     matches: list[Path] = []
     for pattern in LAYER_PATTERNS[key]:
         matches.extend(sorted(data_dir.rglob(pattern)))
@@ -167,7 +183,12 @@ def find_layer(data_dir: Path, key: str) -> Path | None:
         if resolved not in seen:
             seen.add(resolved)
             unique.append(match)
-    return unique[0] if unique else None
+    return unique
+
+
+def find_layer(data_dir: Path, key: str) -> Path | None:
+    matches = find_layers(data_dir, key)
+    return matches[0] if matches else None
 
 
 def shapefile_sidecars_missing(path: Path) -> list[str]:
@@ -175,15 +196,29 @@ def shapefile_sidecars_missing(path: Path) -> list[str]:
     return [path.with_suffix(s).name for s in required if not path.with_suffix(s).exists()]
 
 
-def discover_layers(data_dir: Path) -> dict[str, Path | None]:
-    layers = {key: find_layer(data_dir, key) for key in LAYER_PATTERNS}
-    for key, path in layers.items():
-        if path is None:
-            log(f"{key:12s}: not found")
+def discover_layers(data_dir: Path) -> dict[str, Path | list[Path] | None]:
+    layers: dict[str, Path | list[Path] | None] = {}
+    for key in LAYER_PATTERNS:
+        if key == "roads":
+            paths = find_layers(data_dir, key)
+            layers[key] = paths
+            if not paths:
+                log(f"{key:12s}: not found")
+            else:
+                log(f"{key:12s}: {len(paths)} layer(s)")
+                for path in paths:
+                    missing = shapefile_sidecars_missing(path)
+                    suffix = f" (missing sidecars: {', '.join(missing)})" if missing else ""
+                    log(f"{'':12s}  - {path}{suffix}")
         else:
-            missing = shapefile_sidecars_missing(path)
-            suffix = f" (missing sidecars: {', '.join(missing)})" if missing else ""
-            log(f"{key:12s}: {path}{suffix}")
+            path = find_layer(data_dir, key)
+            layers[key] = path
+            if path is None:
+                log(f"{key:12s}: not found")
+            else:
+                missing = shapefile_sidecars_missing(path)
+                suffix = f" (missing sidecars: {', '.join(missing)})" if missing else ""
+                log(f"{key:12s}: {path}{suffix}")
     return layers
 
 
@@ -208,8 +243,14 @@ def check_inputs(data_dir: Path) -> bool:
 
     if layers["bus_routes"] is None:
         log("\nWARNING: N07 bus route lines were not found. Y minutes will fall back to straight-line distance.")
-    if layers["roads"] is None:
+    road_paths = layers["roads"] if isinstance(layers["roads"], list) else []
+    if not road_paths:
         log("\nWARNING: N13 road lines were not found. X minutes will fall back to circular buffers.")
+    else:
+        found_road_names = {path.name for path in road_paths}
+        missing_road_names = [name for name in EXPECTED_ROAD_MESH_FILES if name not in found_road_names]
+        if missing_road_names:
+            log("\nNOTE: Some expected Utsunomiya road mesh files were not found: " + ", ".join(missing_road_names))
     return True
 
 
@@ -238,6 +279,16 @@ def read_layer(path: Path | None, default_crs: str = CRS_JGD2011_GEOG) -> gpd.Ge
         warnings.warn(f"{path.name} has no CRS; assuming {default_crs}.", stacklevel=2)
         gdf = gdf.set_crs(default_crs, allow_override=True)
     return gdf.to_crs(CRS_ANALYSIS)
+
+
+def read_layers(paths: list[Path] | None, default_crs: str = CRS_JGD2011_GEOG) -> gpd.GeoDataFrame | None:
+    if not paths:
+        return None
+    layers = [read_layer(path, default_crs=default_crs) for path in paths]
+    layers = [layer for layer in layers if layer is not None and not layer.empty]
+    if not layers:
+        return None
+    return gpd.GeoDataFrame(pd.concat(layers, ignore_index=True), geometry="geometry", crs=CRS_ANALYSIS)
 
 
 def first_existing_col(gdf: gpd.GeoDataFrame | None, candidates: list[str]) -> str | None:
@@ -411,6 +462,33 @@ def dijkstra_with_initial_costs(graph, initial_costs: dict[object, float], cutof
     return distances
 
 
+def dijkstra_with_initial_costs_and_labels(graph, initial_records: dict[object, tuple[float, dict]], cutoff: float | None = None) -> tuple[dict[object, float], dict[object, dict]]:
+    distances: dict[object, float] = {}
+    labels: dict[object, dict] = {}
+    heap = [
+        (cost, i, node, label)
+        for i, (node, (cost, label)) in enumerate(initial_records.items())
+        if math.isfinite(cost)
+    ]
+    heapq.heapify(heap)
+    sequence = len(heap)
+    while heap:
+        cost, _, node, label = heapq.heappop(heap)
+        if node in distances:
+            continue
+        if cutoff is not None and cost > cutoff:
+            continue
+        distances[node] = cost
+        labels[node] = label
+        for nbr, attrs in graph[node].items():
+            edge_cost = float(attrs.get("time_min", attrs.get("length_m", 0.0)))
+            next_cost = cost + edge_cost
+            if nbr not in distances and (cutoff is None or next_cost <= cutoff):
+                sequence += 1
+                heapq.heappush(heap, (next_cost, sequence, nbr, label))
+    return distances, labels
+
+
 def set_edge_time(graph, speed_m_per_min: float) -> None:
     for _, _, attrs in graph.edges(data=True):
         attrs["time_min"] = float(attrs["length_m"]) / speed_m_per_min
@@ -436,11 +514,65 @@ def proxy_points_from_bus_routes(bus_routes: gpd.GeoDataFrame, interval_m: float
     return gpd.GeoDataFrame(records, geometry="geometry", crs=CRS_ANALYSIS)
 
 
+def add_bus_transfer_edges(
+    graph,
+    nodes: gpd.GeoDataFrame,
+    snapped_points: pd.DataFrame,
+    radius_m: float = BUS_TRANSFER_RADIUS_M,
+    penalty_min: float = BUS_TRANSFER_PENALTY_MIN,
+) -> int:
+    if snapped_points.empty or radius_m <= 0:
+        return 0
+    transfer_nodes = snapped_points[["node"]].drop_duplicates().merge(nodes, on="node", how="inner")
+    if transfer_nodes.empty:
+        return 0
+
+    left = gpd.GeoDataFrame(
+        transfer_nodes[["node"]].copy(),
+        geometry=transfer_nodes.geometry.buffer(radius_m),
+        crs=CRS_ANALYSIS,
+    )
+    right = transfer_nodes[["node", "geometry"]].rename(columns={"node": "node_right"})
+    pairs = gpd.sjoin(left, right, how="inner", predicate="intersects")
+
+    added = 0
+    seen: set[tuple[object, object]] = set()
+    node_geoms = dict(zip(transfer_nodes["node"], transfer_nodes.geometry))
+    for _, row in pairs.iterrows():
+        a = row["node"]
+        b = row["node_right"]
+        if a == b:
+            continue
+        pair = tuple(sorted([a, b]))
+        if pair in seen:
+            continue
+        seen.add(pair)
+        pa = node_geoms[a]
+        pb = node_geoms[b]
+        distance_m = float(pa.distance(pb))
+        if distance_m > radius_m:
+            continue
+        time_min = distance_m / WALK_SPEED_M_PER_MIN + penalty_min
+        if graph.has_edge(a, b) and float(graph[a][b].get("time_min", math.inf)) <= time_min:
+            continue
+        graph.add_edge(
+            a,
+            b,
+            length_m=distance_m,
+            time_min=time_min,
+            geometry=LineString([pa, pb]),
+            source_row=-1,
+            edge_type="bus_transfer",
+        )
+        added += 1
+    return added
+
+
 def estimate_bus_access(
     bus_points: gpd.GeoDataFrame,
     bus_routes: gpd.GeoDataFrame | None,
     lrt_with_times: gpd.GeoDataFrame,
-    lrt_name_col: str | None,
+    destination_point: gpd.GeoDataFrame,
     max_minutes: float,
 ) -> gpd.GeoDataFrame:
     bus_points = bus_points.copy().reset_index(drop=True)
@@ -451,19 +583,44 @@ def estimate_bus_access(
         bus_graph = build_graph_from_lines(bus_routes)
         set_edge_time(bus_graph.graph, BUS_SPEED_M_PER_MIN)
 
+        bus_snap = snap_points_to_nodes(bus_points, bus_graph.nodes)
+        transfer_edge_count = add_bus_transfer_edges(bus_graph.graph, bus_graph.nodes, bus_snap)
+
         lrt_snap = snap_points_to_nodes(lrt_with_times, bus_graph.nodes)
-        initial = {}
-        node_to_stop = {}
+        destination_snap = snap_points_to_nodes(destination_point, bus_graph.nodes)
+
+        initial_records: dict[object, tuple[float, dict]] = {}
         for _, row in lrt_snap.iterrows():
             stop_idx = int(row["source_index"])
             node = row["node"]
+            snap_cost = float(row["snap_dist_m"]) / WALK_SPEED_M_PER_MIN
             z_min = float(lrt_with_times.loc[stop_idx, "z_lrt_min"])
-            if node not in initial or z_min < initial[node]:
-                initial[node] = z_min
-                node_to_stop[node] = stop_idx
+            label = {
+                "target_type": "lrt_transfer",
+                "transfer_stop": str(lrt_with_times.loc[stop_idx, "transfer_stop"]),
+                "z_lrt_min": z_min,
+                "target_snap_dist_m": float(row["snap_dist_m"]),
+            }
+            cost = z_min + snap_cost
+            if node not in initial_records or cost < initial_records[node][0]:
+                initial_records[node] = (cost, label)
 
-        node_costs = dijkstra_with_initial_costs(bus_graph.graph, initial, cutoff=max_minutes)
-        bus_snap = snap_points_to_nodes(bus_points, bus_graph.nodes)
+        for _, row in destination_snap.iterrows():
+            node = row["node"]
+            snap_dist = float(row["snap_dist_m"])
+            if snap_dist > BUS_TARGET_SNAP_MAX_M:
+                continue
+            snap_cost = snap_dist / WALK_SPEED_M_PER_MIN
+            label = {
+                "target_type": "direct_bus_destination",
+                "transfer_stop": "destination_by_bus",
+                "z_lrt_min": 0.0,
+                "target_snap_dist_m": snap_dist,
+            }
+            if node not in initial_records or snap_cost < initial_records[node][0]:
+                initial_records[node] = (snap_cost, label)
+
+        node_costs, node_labels = dijkstra_with_initial_costs_and_labels(bus_graph.graph, initial_records, cutoff=max_minutes)
         transfer_rows = []
         for _, row in bus_snap.iterrows():
             bus_idx = int(row["source_index"])
@@ -471,19 +628,20 @@ def estimate_bus_access(
             total_min = node_costs.get(node, math.inf)
             if not math.isfinite(total_min):
                 continue
-            # Find the best transfer stop with a second, small Dijkstra from this bus node.
-            transfer_stop_idx = nearest_transfer_stop(bus_graph.graph, node, lrt_snap, lrt_with_times)
-            z_min = float(lrt_with_times.loc[transfer_stop_idx, "z_lrt_min"])
-            transfer_name = str(lrt_with_times.loc[transfer_stop_idx, "transfer_stop"])
+            label = node_labels.get(node, {})
+            z_min = float(label.get("z_lrt_min", 0.0))
             transfer_rows.append(
                 {
                     "source_index": bus_idx,
                     "bus_min": max(total_min - z_min, 0.0),
                     "z_lrt_min": z_min,
                     "total_transit_min": total_min,
-                    "transfer_stop": transfer_name,
-                    "network_method": "N07_bus_route_network",
+                    "transfer_stop": str(label.get("transfer_stop", "unknown")),
+                    "target_type": str(label.get("target_type", "unknown")),
+                    "network_method": "N07_bus_route_network_with_transfers",
                     "bus_snap_dist_m": float(row["snap_dist_m"]),
+                    "target_snap_dist_m": float(label.get("target_snap_dist_m", np.nan)),
+                    "transfer_edges": transfer_edge_count,
                 }
             )
         estimates = pd.DataFrame(transfer_rows)
@@ -491,41 +649,31 @@ def estimate_bus_access(
         return gpd.GeoDataFrame(out.drop(columns=["source_index"]), geometry="geometry", crs=CRS_ANALYSIS)
 
     lrt_coords = lrt_with_times[["transfer_stop", "z_lrt_min", "geometry"]].copy()
+    lrt_coords["target_type"] = "lrt_transfer"
+    destination_fallback = destination_point.copy()
+    destination_fallback["transfer_stop"] = "destination_by_bus"
+    destination_fallback["z_lrt_min"] = 0.0
+    destination_fallback["target_type"] = "direct_bus_destination"
+    target_points = pd.concat([lrt_coords, destination_fallback[["transfer_stop", "z_lrt_min", "target_type", "geometry"]]], ignore_index=True)
+    target_points = gpd.GeoDataFrame(target_points, geometry="geometry", crs=CRS_ANALYSIS)
     joined = gpd.sjoin_nearest(
         bus_points.reset_index(names="source_index"),
-        lrt_coords,
+        target_points,
         how="left",
-        distance_col="straight_lrt_dist_m",
+        distance_col="straight_target_dist_m",
     )
-    joined["bus_min"] = joined["straight_lrt_dist_m"] * ROAD_DISTANCE_FACTOR / BUS_SPEED_M_PER_MIN
+    joined["bus_min"] = joined["straight_target_dist_m"] * ROAD_DISTANCE_FACTOR / BUS_SPEED_M_PER_MIN
     joined["total_transit_min"] = joined["bus_min"] + joined["z_lrt_min"]
     joined["network_method"] = "straight_line_fallback"
     return gpd.GeoDataFrame(joined, geometry="geometry", crs=CRS_ANALYSIS)
 
-
-def nearest_transfer_stop(graph, source_node, lrt_snap: pd.DataFrame, lrt_with_times: gpd.GeoDataFrame) -> int:
-    target_nodes = {row["node"]: int(row["source_index"]) for _, row in lrt_snap.iterrows()}
-    cutoff = 90.0
-    lengths = nx.single_source_dijkstra_path_length(graph, source_node, cutoff=cutoff, weight="time_min")
-    best_idx = None
-    best_cost = math.inf
-    for node, stop_idx in target_nodes.items():
-        if node not in lengths:
-            continue
-        cost = float(lengths[node]) + float(lrt_with_times.loc[stop_idx, "z_lrt_min"])
-        if cost < best_cost:
-            best_cost = cost
-            best_idx = stop_idx
-    if best_idx is None:
-        # This should be rare because caller already found a finite multi-source cost.
-        return int(lrt_with_times["z_lrt_min"].idxmin())
-    return int(best_idx)
 
 
 def prepare_access_nodes(
     lrt_with_times: gpd.GeoDataFrame,
     bus_stops: gpd.GeoDataFrame | None,
     bus_routes: gpd.GeoDataFrame | None,
+    destination_point: gpd.GeoDataFrame,
     max_minutes: float,
 ) -> gpd.GeoDataFrame:
     lrt_access = lrt_with_times[
@@ -553,7 +701,7 @@ def prepare_access_nodes(
         return lrt_access
 
     lrt_name_col = first_existing_col(lrt_with_times, NAME_CANDIDATES["lrt_stops"])
-    bus_estimates = estimate_bus_access(bus_points, bus_routes, lrt_with_times, lrt_name_col, max_minutes)
+    bus_estimates = estimate_bus_access(bus_points, bus_routes, lrt_with_times, destination_point, max_minutes)
     keep_cols = [
         "access_type",
         "bus_stop_name",
@@ -562,6 +710,7 @@ def prepare_access_nodes(
         "z_lrt_min",
         "total_transit_min",
         "network_method",
+        "target_type",
         "geometry",
     ]
     for col in keep_cols:
@@ -727,11 +876,17 @@ def run_analysis(args: argparse.Namespace) -> int:
     bus_stops = clip_to_polygon(bus_stops, analysis_area)
     bus_routes = clip_to_polygon(bus_routes, analysis_area)
 
-    roads = read_layer(layers["roads"]) if layers["roads"] else None
+    road_paths = layers["roads"] if isinstance(layers["roads"], list) else []
+    roads = read_layers(road_paths)
     roads = explode_lines(roads)
     roads = clip_to_polygon(roads, analysis_area) if roads is not None else None
 
-    access_nodes = prepare_access_nodes(lrt_with_times, bus_stops, bus_routes, max_threshold)
+    destination_point = gpd.GeoDataFrame(
+        {"target_type": ["destination"], "geometry": [destination.geometry]},
+        geometry="geometry",
+        crs=CRS_ANALYSIS,
+    )
+    access_nodes = prepare_access_nodes(lrt_with_times, bus_stops, bus_routes, destination_point, max_threshold)
     access_nodes = access_nodes[access_nodes["total_transit_min"].le(max_threshold)].copy()
     access_nodes["total_transit_min"] = access_nodes["total_transit_min"].round(3)
     access_nodes["bus_min"] = pd.to_numeric(access_nodes["bus_min"], errors="coerce").round(3)

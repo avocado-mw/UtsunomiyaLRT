@@ -434,11 +434,19 @@ python3 scripts/kiyohara_transit_isochrone.py \
 ```
 
 The same workflow is available in `kiyohara_transit_isochrone_analysis.ipynb`.
-It estimates `Z` from cumulative LRT stop-to-stop length at 20 km/h, estimates
-`Y` from the attached N07 bus route line layer (`N07-11_09_GML.shp`) at
-20 km/h when present, and uses remaining time for road-network walking
-isochrones from bus/LRT access nodes. Complete shapefile sidecars must be
-placed under `data/`; the script reports missing inputs before analysis.
+It estimates `Z` from cumulative LRT stop-to-stop length at 20 km/h and
+estimates `Y` from the attached N07 bus route line layer (`N07-11_09_GML.shp`)
+at 20 km/h when present. The bus network permits additive multi-route travel
+(`bus -> bus -> LRT`) and direct bus access to the destination
+(`bus -> bus -> destination`) when those paths are connected in the route
+network. Remaining time is used for road-network walking isochrones from
+bus/LRT access nodes.
+
+For road-network walking, the script combines all available Utsunomiya N13
+road mesh shapefiles under `data/`, including `N13-24_5439.shp`,
+`N13-24-5440.shp`, `N13-24-5539.shp`, and `N13-24-5540.shp` when present.
+Complete shapefile sidecars must be placed under `data/`; the script reports
+missing inputs before analysis.
 
 ### 1. Load Data and Standardize CRS
 
