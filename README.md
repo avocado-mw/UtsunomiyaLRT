@@ -439,7 +439,12 @@ estimates `Y` from the attached N07 bus route line layer (`N07-11_09_GML.shp`)
 at 20 km/h when present. The bus network permits additive multi-route travel
 (`bus -> bus -> LRT`) and direct bus access to the destination
 (`bus -> bus -> destination`) when those paths are connected in the route
-network. Remaining time is used for road-network walking isochrones from
+network. Waiting time is modeled as expected wait = average headway / 2: bus
+boarding and bus re-boarding use `BUS_WAIT_TIME_MIN = 8`, and LRT boarding
+uses `LRT_WAIT_TIME_MIN = 5`. `TRANSFER_PENALTY_MIN` remains 0 because
+physical transfer walking is represented spatially by the route/road network;
+wait penalties are applied when entering a bus or LRT route, not when
+alighting. Remaining time is used for road-network walking isochrones from
 bus/LRT access nodes.
 
 For road-network walking, the script requires all four Utsunomiya N13 road

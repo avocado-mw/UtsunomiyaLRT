@@ -10,7 +10,9 @@ Travel speeds are intentionally simple scenario assumptions:
 
 * LRT: 20 km/h, estimated from cumulative distance through lrt_stops.shp.
 * Feeder bus: 20 km/h, estimated along N07 bus route lines when present.
-* Walking: 80 m/min along road lines when an N13 road layer is present.
+* Waiting: expected wait = average headway / 2; bus wait is rounded to
+  8 minutes and LRT wait is rounded to 5 minutes.
+* Walking: 80 m/min along road lines when the required N13 road meshes are present.
 
 Outputs are written under outputs/kiyohara_isochrone/ and include GeoPackage
 layers, shapefiles, CSV diagnostics, and a PNG map.
@@ -90,8 +92,10 @@ BUS_SPEED_M_PER_MIN = 20_000 / 60
 WALK_SPEED_M_PER_MIN = 80
 ROAD_DISTANCE_FACTOR = 1.1666
 WALK_CORRIDOR_BUFFER_M = 40
+BUS_WAIT_TIME_MIN = 8.0
+LRT_WAIT_TIME_MIN = 5.0
 BUS_TRANSFER_RADIUS_M = 250
-BUS_TRANSFER_PENALTY_MIN = 0.0
+TRANSFER_PENALTY_MIN = 0.0
 BUS_TARGET_SNAP_MAX_M = 750
 
 DEFAULT_THRESHOLDS = (30, 60)
@@ -421,7 +425,9 @@ def add_lrt_times(lrt_stops: gpd.GeoDataFrame, name_col: str | None, target_rege
     ordered["access_type"] = "lrt_stop"
     ordered["transfer_stop"] = ordered[name_col].map(clean_name) if name_col else [f"LRT_{i:02d}" for i in ordered.index]
     ordered["bus_min"] = 0.0
-    ordered["total_transit_min"] = ordered["z_lrt_min"]
+    ordered["bus_wait_min"] = 0.0
+    ordered["lrt_wait_min"] = np.where(ordered["z_lrt_min"].gt(0), LRT_WAIT_TIME_MIN, 0.0)
+    ordered["total_transit_min"] = ordered["z_lrt_min"] + ordered["lrt_wait_min"]
     return ordered
 
 
@@ -547,7 +553,7 @@ def add_bus_transfer_edges(
     nodes: gpd.GeoDataFrame,
     snapped_points: pd.DataFrame,
     radius_m: float = BUS_TRANSFER_RADIUS_M,
-    penalty_min: float = BUS_TRANSFER_PENALTY_MIN,
+    penalty_min: float = TRANSFER_PENALTY_MIN,
 ) -> int:
     if snapped_points.empty or radius_m <= 0:
         return 0
@@ -582,7 +588,9 @@ def add_bus_transfer_edges(
         distance_m = float(pa.distance(pb))
         if distance_m > radius_m:
             continue
-        time_min = distance_m / WALK_SPEED_M_PER_MIN + penalty_min
+        # Physical transfer walking is represented by distance; the separate wait
+        # penalty represents boarding the next bus after a bus-to-bus transfer.
+        time_min = distance_m / WALK_SPEED_M_PER_MIN + penalty_min + BUS_WAIT_TIME_MIN
         if graph.has_edge(a, b) and float(graph[a][b].get("time_min", math.inf)) <= time_min:
             continue
         graph.add_edge(
@@ -625,13 +633,15 @@ def estimate_bus_access(
             node = row["node"]
             snap_cost = float(row["snap_dist_m"]) / WALK_SPEED_M_PER_MIN
             z_min = float(lrt_with_times.loc[stop_idx, "z_lrt_min"])
+            lrt_wait_min = float(lrt_with_times.loc[stop_idx, "lrt_wait_min"])
             label = {
                 "target_type": "lrt_transfer",
                 "transfer_stop": str(lrt_with_times.loc[stop_idx, "transfer_stop"]),
                 "z_lrt_min": z_min,
+                "lrt_wait_min": lrt_wait_min,
                 "target_snap_dist_m": float(row["snap_dist_m"]),
             }
-            cost = z_min + snap_cost
+            cost = z_min + lrt_wait_min + snap_cost
             if node not in initial_records or cost < initial_records[node][0]:
                 initial_records[node] = (cost, label)
 
@@ -645,6 +655,7 @@ def estimate_bus_access(
                 "target_type": "direct_bus_destination",
                 "transfer_stop": "destination_by_bus",
                 "z_lrt_min": 0.0,
+                "lrt_wait_min": 0.0,
                 "target_snap_dist_m": snap_dist,
             }
             if node not in initial_records or snap_cost < initial_records[node][0]:
@@ -660,12 +671,16 @@ def estimate_bus_access(
                 continue
             label = node_labels.get(node, {})
             z_min = float(label.get("z_lrt_min", 0.0))
+            lrt_wait_min = float(label.get("lrt_wait_min", 0.0))
+            bus_total_min = total_min + BUS_WAIT_TIME_MIN
             transfer_rows.append(
                 {
                     "source_index": bus_idx,
-                    "bus_min": max(total_min - z_min, 0.0),
+                    "bus_min": max(bus_total_min - z_min - lrt_wait_min, 0.0),
+                    "bus_wait_min": BUS_WAIT_TIME_MIN,
                     "z_lrt_min": z_min,
-                    "total_transit_min": total_min,
+                    "lrt_wait_min": lrt_wait_min,
+                    "total_transit_min": bus_total_min,
                     "transfer_stop": str(label.get("transfer_stop", "unknown")),
                     "target_type": str(label.get("target_type", "unknown")),
                     "network_method": "N07_bus_route_network_with_transfers",
@@ -678,13 +693,14 @@ def estimate_bus_access(
         out = bus_points.merge(estimates, left_index=True, right_on="source_index", how="inner")
         return gpd.GeoDataFrame(out.drop(columns=["source_index"]), geometry="geometry", crs=CRS_ANALYSIS)
 
-    lrt_coords = lrt_with_times[["transfer_stop", "z_lrt_min", "geometry"]].copy()
+    lrt_coords = lrt_with_times[["transfer_stop", "z_lrt_min", "lrt_wait_min", "geometry"]].copy()
     lrt_coords["target_type"] = "lrt_transfer"
     destination_fallback = destination_point.copy()
     destination_fallback["transfer_stop"] = "destination_by_bus"
     destination_fallback["z_lrt_min"] = 0.0
+    destination_fallback["lrt_wait_min"] = 0.0
     destination_fallback["target_type"] = "direct_bus_destination"
-    target_points = pd.concat([lrt_coords, destination_fallback[["transfer_stop", "z_lrt_min", "target_type", "geometry"]]], ignore_index=True)
+    target_points = pd.concat([lrt_coords, destination_fallback[["transfer_stop", "z_lrt_min", "lrt_wait_min", "target_type", "geometry"]]], ignore_index=True)
     target_points = gpd.GeoDataFrame(target_points, geometry="geometry", crs=CRS_ANALYSIS)
     joined = gpd.sjoin_nearest(
         bus_points.reset_index(names="source_index"),
@@ -692,8 +708,9 @@ def estimate_bus_access(
         how="left",
         distance_col="straight_target_dist_m",
     )
-    joined["bus_min"] = joined["straight_target_dist_m"] * ROAD_DISTANCE_FACTOR / BUS_SPEED_M_PER_MIN
-    joined["total_transit_min"] = joined["bus_min"] + joined["z_lrt_min"]
+    joined["bus_wait_min"] = BUS_WAIT_TIME_MIN
+    joined["bus_min"] = joined["straight_target_dist_m"] * ROAD_DISTANCE_FACTOR / BUS_SPEED_M_PER_MIN + joined["bus_wait_min"]
+    joined["total_transit_min"] = joined["bus_min"] + joined["z_lrt_min"] + joined["lrt_wait_min"]
     joined["network_method"] = "straight_line_fallback"
     return gpd.GeoDataFrame(joined, geometry="geometry", crs=CRS_ANALYSIS)
 
@@ -707,7 +724,7 @@ def prepare_access_nodes(
     max_minutes: float,
 ) -> gpd.GeoDataFrame:
     lrt_access = lrt_with_times[
-        ["access_type", "transfer_stop", "z_lrt_min", "bus_min", "total_transit_min", "geometry"]
+        ["access_type", "transfer_stop", "z_lrt_min", "bus_min", "bus_wait_min", "lrt_wait_min", "total_transit_min", "geometry"]
     ].copy()
     lrt_access["network_method"] = "direct_lrt_stop"
 
@@ -737,7 +754,9 @@ def prepare_access_nodes(
         "bus_stop_name",
         "transfer_stop",
         "bus_min",
+        "bus_wait_min",
         "z_lrt_min",
+        "lrt_wait_min",
         "total_transit_min",
         "network_method",
         "target_type",
@@ -922,7 +941,9 @@ def run_analysis(args: argparse.Namespace) -> int:
     access_nodes = access_nodes[access_nodes["total_transit_min"].le(max_threshold)].copy()
     access_nodes["total_transit_min"] = access_nodes["total_transit_min"].round(3)
     access_nodes["bus_min"] = pd.to_numeric(access_nodes["bus_min"], errors="coerce").round(3)
+    access_nodes["bus_wait_min"] = pd.to_numeric(access_nodes["bus_wait_min"], errors="coerce").round(3)
     access_nodes["z_lrt_min"] = pd.to_numeric(access_nodes["z_lrt_min"], errors="coerce").round(3)
+    access_nodes["lrt_wait_min"] = pd.to_numeric(access_nodes["lrt_wait_min"], errors="coerce").round(3)
 
     if access_nodes.empty:
         raise RuntimeError("No transit access nodes are reachable within the requested thresholds.")
