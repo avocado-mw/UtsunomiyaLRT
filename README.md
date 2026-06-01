@@ -436,16 +436,22 @@ python3 scripts/kiyohara_transit_isochrone.py \
 The same workflow is available in `kiyohara_transit_isochrone_analysis.ipynb`.
 It estimates `Z` from cumulative LRT stop-to-stop length at 20 km/h and
 estimates `Y` from the attached N07 bus route line layer (`N07-11_09_GML.shp`)
-at 20 km/h when present. The bus network permits additive multi-route travel
+at 20 km/h when present. It also loads conventional rail sections and stations
+from `N05-25_RailroadSection2.shp` and `N05-25_Station2.shp`, clips them to
+the same analysis area as other layers, and produces both no-train and
+with-train isochrone scenarios. Conventional rail travel uses a rough
+`RAIL_SPEED_M_PER_MIN = 40_000 / 60` assumption when timetable travel times
+are unavailable. The bus network permits additive multi-route travel
 (`bus -> bus -> LRT`) and direct bus access to the destination
 (`bus -> bus -> destination`) when those paths are connected in the route
 network. Waiting time is modeled as expected wait = average headway / 2: bus
-boarding and bus re-boarding use `BUS_WAIT_TIME_MIN = 8`, and LRT boarding
-uses `LRT_WAIT_TIME_MIN = 5`. `TRANSFER_PENALTY_MIN` remains 0 because
-physical transfer walking is represented spatially by the route/road network;
-wait penalties are applied when entering a bus or LRT route, not when
+boarding and bus re-boarding use `BUS_WAIT_TIME_MIN = 8`, LRT boarding uses
+`LRT_WAIT_TIME_MIN = 5`, and conventional rail boarding uses
+`RAIL_WAIT_TIME_MIN = 10`. `TRANSFER_PENALTY_MIN` remains 0 because physical
+transfer walking is represented spatially by the route/road network; wait
+penalties are applied when entering a bus, LRT, or rail route, not when
 alighting. Remaining time is used for road-network walking isochrones from
-bus/LRT access nodes.
+bus/LRT/rail access nodes.
 
 For road-network walking, the script requires all four Utsunomiya N13 road
 mesh shapefiles before the analysis will run: `N13-24_5439.shp`,

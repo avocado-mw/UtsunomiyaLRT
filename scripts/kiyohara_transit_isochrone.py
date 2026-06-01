@@ -11,7 +11,8 @@ Travel speeds are intentionally simple scenario assumptions:
 * LRT: 20 km/h, estimated from cumulative distance through lrt_stops.shp.
 * Feeder bus: 20 km/h, estimated along N07 bus route lines when present.
 * Waiting: expected wait = average headway / 2; bus wait is rounded to
-  8 minutes and LRT wait is rounded to 5 minutes.
+  8 minutes, LRT wait is rounded to 5 minutes, and conventional rail wait
+  is set to 10 minutes.
 * Walking: 80 m/min along road lines when the required N13 road meshes are present.
 
 Outputs are written under outputs/kiyohara_isochrone/ and include GeoPackage
@@ -89,14 +90,17 @@ CRS_ANALYSIS = "EPSG:6678"
 
 LRT_SPEED_M_PER_MIN = 20_000 / 60
 BUS_SPEED_M_PER_MIN = 20_000 / 60
+RAIL_SPEED_M_PER_MIN = 40_000 / 60
 WALK_SPEED_M_PER_MIN = 80
 ROAD_DISTANCE_FACTOR = 1.1666
 WALK_CORRIDOR_BUFFER_M = 40
 BUS_WAIT_TIME_MIN = 8.0
 LRT_WAIT_TIME_MIN = 5.0
+RAIL_WAIT_TIME_MIN = 10.0
 BUS_TRANSFER_RADIUS_M = 250
 TRANSFER_PENALTY_MIN = 0.0
 BUS_TARGET_SNAP_MAX_M = 750
+RAIL_TARGET_WALK_MAX_M = 1_000
 
 DEFAULT_THRESHOLDS = (30, 60)
 DEFAULT_TARGET_STOP_REGEX = r"清原|工業団地"
@@ -127,6 +131,19 @@ LAYER_PATTERNS = {
         "*bus*route*.shp",
         "*バス*路線*.shp",
     ],
+    "rail_lines": [
+        "N05-25_RailroadSection2.shp",
+        "*RailroadSection*.shp",
+        "*rail*line*.shp",
+        "*鉄道*区間*.shp",
+    ],
+    "rail_stations": [
+        "N05-25_Station2.shp",
+        "*Station2.shp",
+        "*Station*.shp",
+        "*rail*station*.shp",
+        "*鉄道*駅*.shp",
+    ],
     "roads": [
         "N13-24_5439.shp",
         "N13-24-5439.shp",
@@ -151,6 +168,7 @@ NAME_CANDIDATES = {
     "lrt_stops": ["stop_name", "name", "station", "駅名", "停留場名", "N05_011", "S12_001"],
     "bus_stops": ["P11_001", "stop_name", "name", "バス停名"],
     "bus_routes": ["N07_003", "route_name", "name", "路線名"],
+    "rail_stations": ["N05_011", "station_name", "name", "駅名"],
 }
 
 ORDER_CANDIDATES = [
@@ -237,6 +255,15 @@ def validate_required_inputs(layers: dict[str, Path | list[Path] | None]) -> lis
         missing = shapefile_sidecars_missing(lrt_path)
         if missing:
             errors.append(f"lrt_stops: missing {', '.join(missing)}")
+
+    for key, label in [("rail_lines", "N05-25_RailroadSection2.shp"), ("rail_stations", "N05-25_Station2.shp")]:
+        path = layers.get(key)
+        if not isinstance(path, Path):
+            errors.append(f"{key}: missing required {label}")
+        else:
+            missing = shapefile_sidecars_missing(path)
+            if missing:
+                errors.append(f"{key}: {path} missing {', '.join(missing)}")
 
     road_paths = layers.get("roads") if isinstance(layers.get("roads"), list) else []
     errors.extend(required_road_mesh_errors(road_paths))
@@ -769,6 +796,156 @@ def prepare_access_nodes(
     return gpd.GeoDataFrame(access_nodes, geometry="geometry", crs=CRS_ANALYSIS)
 
 
+def estimate_rail_access(
+    rail_stations: gpd.GeoDataFrame | None,
+    rail_lines: gpd.GeoDataFrame | None,
+    lrt_with_times: gpd.GeoDataFrame,
+    destination_point: gpd.GeoDataFrame,
+    max_minutes: float,
+) -> gpd.GeoDataFrame:
+    if rail_stations is None or rail_lines is None or rail_stations.empty or rail_lines.empty or nx is None:
+        return gpd.GeoDataFrame(columns=["geometry"], geometry="geometry", crs=CRS_ANALYSIS)
+
+    station_name_col = first_existing_col(rail_stations, NAME_CANDIDATES["rail_stations"])
+    stations = force_points(rail_stations, None).reset_index(drop=True)
+    if station_name_col:
+        stations["rail_station_name"] = stations[station_name_col].map(clean_name)
+    else:
+        stations["rail_station_name"] = [f"rail_station_{i:05d}" for i in range(len(stations))]
+    stations["access_type"] = "rail_station"
+
+    rail_graph = build_graph_from_lines(rail_lines)
+    set_edge_time(rail_graph.graph, RAIL_SPEED_M_PER_MIN)
+    station_snap = snap_points_to_nodes(stations, rail_graph.nodes)
+    if station_snap.empty:
+        return gpd.GeoDataFrame(columns=["geometry"], geometry="geometry", crs=CRS_ANALYSIS)
+
+    lrt_targets = lrt_with_times[["transfer_stop", "z_lrt_min", "lrt_wait_min", "geometry"]].copy()
+    station_to_lrt = gpd.sjoin_nearest(
+        stations.reset_index(names="station_idx"),
+        lrt_targets,
+        how="left",
+        distance_col="rail_lrt_transfer_dist_m",
+    )
+    station_to_lrt["rail_lrt_transfer_walk_min"] = (
+        station_to_lrt["rail_lrt_transfer_dist_m"] * ROAD_DISTANCE_FACTOR / WALK_SPEED_M_PER_MIN
+    )
+
+    destination_join = gpd.sjoin_nearest(
+        stations.reset_index(names="station_idx"),
+        destination_point,
+        how="left",
+        distance_col="rail_destination_walk_dist_m",
+    )
+    destination_join["rail_destination_walk_min"] = (
+        destination_join["rail_destination_walk_dist_m"] * ROAD_DISTANCE_FACTOR / WALK_SPEED_M_PER_MIN
+    )
+
+    initial_records: dict[object, tuple[float, dict]] = {}
+    station_snap_by_idx = station_snap.set_index("source_index")
+    for _, row in station_to_lrt.iterrows():
+        station_idx = int(row["station_idx"])
+        if station_idx not in station_snap_by_idx.index:
+            continue
+        snap_row = station_snap_by_idx.loc[station_idx]
+        if isinstance(snap_row, pd.DataFrame):
+            snap_row = snap_row.iloc[0]
+        node = snap_row["node"]
+        snap_cost = float(snap_row["snap_dist_m"]) / WALK_SPEED_M_PER_MIN
+        z_min = float(row["z_lrt_min"])
+        lrt_wait_min = float(row["lrt_wait_min"])
+        transfer_walk_min = float(row["rail_lrt_transfer_walk_min"])
+        cost = snap_cost + transfer_walk_min + lrt_wait_min + z_min
+        label = {
+            "target_type": "rail_to_lrt_transfer",
+            "transfer_stop": str(row["transfer_stop"]),
+            "z_lrt_min": z_min,
+            "lrt_wait_min": lrt_wait_min,
+            "rail_lrt_transfer_walk_min": transfer_walk_min,
+            "rail_destination_walk_min": 0.0,
+        }
+        if node not in initial_records or cost < initial_records[node][0]:
+            initial_records[node] = (cost, label)
+
+    for _, row in destination_join.iterrows():
+        walk_dist = float(row["rail_destination_walk_dist_m"])
+        if walk_dist > RAIL_TARGET_WALK_MAX_M:
+            continue
+        station_idx = int(row["station_idx"])
+        if station_idx not in station_snap_by_idx.index:
+            continue
+        snap_row = station_snap_by_idx.loc[station_idx]
+        if isinstance(snap_row, pd.DataFrame):
+            snap_row = snap_row.iloc[0]
+        node = snap_row["node"]
+        snap_cost = float(snap_row["snap_dist_m"]) / WALK_SPEED_M_PER_MIN
+        walk_min = float(row["rail_destination_walk_min"])
+        cost = snap_cost + walk_min
+        label = {
+            "target_type": "direct_rail_destination",
+            "transfer_stop": "destination_by_rail",
+            "z_lrt_min": 0.0,
+            "lrt_wait_min": 0.0,
+            "rail_lrt_transfer_walk_min": 0.0,
+            "rail_destination_walk_min": walk_min,
+        }
+        if node not in initial_records or cost < initial_records[node][0]:
+            initial_records[node] = (cost, label)
+
+    node_costs, node_labels = dijkstra_with_initial_costs_and_labels(rail_graph.graph, initial_records, cutoff=max_minutes)
+    records = []
+    for _, row in station_snap.iterrows():
+        station_idx = int(row["source_index"])
+        node = row["node"]
+        rail_to_target_min = node_costs.get(node, math.inf)
+        if not math.isfinite(rail_to_target_min):
+            continue
+        label = node_labels.get(node, {})
+        source_snap_min = float(row["snap_dist_m"]) / WALK_SPEED_M_PER_MIN
+        total_min = RAIL_WAIT_TIME_MIN + source_snap_min + rail_to_target_min
+        records.append(
+            {
+                "access_type": "rail_station",
+                "rail_station_name": stations.loc[station_idx, "rail_station_name"],
+                "transfer_stop": str(label.get("transfer_stop", "unknown")),
+                "target_type": str(label.get("target_type", "unknown")),
+                "rail_min": total_min - float(label.get("z_lrt_min", 0.0)) - float(label.get("lrt_wait_min", 0.0)),
+                "rail_wait_min": RAIL_WAIT_TIME_MIN,
+                "rail_lrt_transfer_walk_min": float(label.get("rail_lrt_transfer_walk_min", 0.0)),
+                "rail_destination_walk_min": float(label.get("rail_destination_walk_min", 0.0)),
+                "bus_min": 0.0,
+                "bus_wait_min": 0.0,
+                "z_lrt_min": float(label.get("z_lrt_min", 0.0)),
+                "lrt_wait_min": float(label.get("lrt_wait_min", 0.0)),
+                "total_transit_min": total_min,
+                "network_method": "N05_rail_network_with_lrt_transfer",
+                "geometry": stations.loc[station_idx, "geometry"],
+            }
+        )
+
+    if not records:
+        return gpd.GeoDataFrame(columns=["geometry"], geometry="geometry", crs=CRS_ANALYSIS)
+    return gpd.GeoDataFrame(records, geometry="geometry", crs=CRS_ANALYSIS)
+
+
+def make_isochrones(
+    access_nodes: gpd.GeoDataFrame,
+    roads: gpd.GeoDataFrame | None,
+    thresholds: list[float],
+) -> dict[int, gpd.GeoDataFrame]:
+    isochrones = {}
+    for threshold in thresholds:
+        if roads is not None and not roads.empty and nx is not None:
+            isochrones[int(threshold)] = make_road_network_isochrone(access_nodes, roads, threshold)
+        else:
+            warnings.warn(
+                "Road network layer or networkx is unavailable; using fallback walking buffers for X minutes.",
+                stacklevel=2,
+            )
+            isochrones[int(threshold)] = make_fallback_isochrone(access_nodes, threshold)
+    return isochrones
+
+
 def make_road_network_isochrone(
     access_nodes: gpd.GeoDataFrame,
     roads: gpd.GeoDataFrame,
@@ -833,10 +1010,14 @@ def make_fallback_isochrone(access_nodes: gpd.GeoDataFrame, threshold_min: float
 
 def write_outputs(
     out_dir: Path,
-    access_nodes: gpd.GeoDataFrame,
+    access_nodes_no_train: gpd.GeoDataFrame,
+    access_nodes_with_train: gpd.GeoDataFrame,
+    rail_access_nodes: gpd.GeoDataFrame,
     lrt_with_times: gpd.GeoDataFrame,
-    isochrones: dict[int, gpd.GeoDataFrame],
+    isochrones_no_train: dict[int, gpd.GeoDataFrame],
+    isochrones_with_train: dict[int, gpd.GeoDataFrame],
     bus_routes: gpd.GeoDataFrame | None,
+    rail_lines: gpd.GeoDataFrame | None,
     roads: gpd.GeoDataFrame | None,
 ) -> None:
     shp_dir = out_dir / "shapefiles"
@@ -849,16 +1030,39 @@ def write_outputs(
     if gpkg.exists():
         gpkg.unlink()
 
-    access_nodes.to_file(gpkg, layer="access_nodes", driver="GPKG")
+    access_nodes_no_train.to_file(gpkg, layer="access_nodes", driver="GPKG")
+    access_nodes_with_train.to_file(gpkg, layer="access_nodes_with_train", driver="GPKG")
+    if rail_access_nodes is not None and not rail_access_nodes.empty:
+        rail_access_nodes.to_file(gpkg, layer="rail_access_nodes", driver="GPKG")
     lrt_with_times.to_file(gpkg, layer="lrt_travel_times", driver="GPKG")
-    access_nodes.drop(columns="geometry").to_csv(table_dir / "kiyohara_transit_access_nodes.csv", index=False)
+    access_nodes_no_train.drop(columns="geometry").to_csv(table_dir / "kiyohara_transit_access_nodes.csv", index=False)
+    access_nodes_with_train.drop(columns="geometry").to_csv(table_dir / "kiyohara_transit_access_nodes_with_train.csv", index=False)
+    if rail_access_nodes is not None and not rail_access_nodes.empty:
+        rail_access_nodes.drop(columns="geometry").to_csv(table_dir / "kiyohara_rail_access_nodes.csv", index=False)
     lrt_with_times.drop(columns="geometry").to_csv(table_dir / "kiyohara_lrt_travel_times.csv", index=False)
 
-    for threshold, layer in isochrones.items():
+    for threshold, layer in isochrones_no_train.items():
         layer.to_file(gpkg, layer=f"isochrone_{threshold}min", driver="GPKG")
         layer.to_file(shp_dir / f"kiyohara_isochrone_{threshold}min.shp", encoding="utf-8")
+    for threshold, layer in isochrones_with_train.items():
+        layer.to_file(gpkg, layer=f"isochrone_with_train_{threshold}min", driver="GPKG")
+        layer.to_file(shp_dir / f"kiyohara_isochrone_with_train_{threshold}min.shp", encoding="utf-8")
 
-    plot_isochrones(fig_dir / "kiyohara_transit_isochrones.png", access_nodes, isochrones, bus_routes, roads)
+    plot_isochrones(
+        fig_dir / "kiyohara_transit_isochrones.png",
+        access_nodes_no_train,
+        isochrones_no_train,
+        bus_routes,
+        roads,
+    )
+    plot_isochrone_scenarios(
+        fig_dir / "kiyohara_transit_isochrones_train_comparison.png",
+        isochrones_no_train,
+        isochrones_with_train,
+        access_nodes_with_train,
+        rail_lines,
+        roads,
+    )
     log(f"\nWrote outputs to {out_dir}")
 
 
@@ -896,6 +1100,52 @@ def plot_isochrones(
     plt.close(fig)
 
 
+def plot_isochrone_scenarios(
+    fig_path: Path,
+    isochrones_no_train: dict[int, gpd.GeoDataFrame],
+    isochrones_with_train: dict[int, gpd.GeoDataFrame],
+    access_nodes_with_train: gpd.GeoDataFrame,
+    rail_lines: gpd.GeoDataFrame | None,
+    roads: gpd.GeoDataFrame | None,
+) -> None:
+    thresholds = sorted(isochrones_with_train.keys())
+    fig, axes = plt.subplots(1, len(thresholds), figsize=(7 * len(thresholds), 7))
+    if len(thresholds) == 1:
+        axes = [axes]
+    for ax, threshold in zip(axes, thresholds):
+        if roads is not None and not roads.empty:
+            roads.plot(ax=ax, color="#eeeeee", linewidth=0.15)
+        if rail_lines is not None and not rail_lines.empty:
+            rail_lines.plot(ax=ax, color="#636363", linewidth=0.8, alpha=0.7)
+        isochrones_with_train[threshold].plot(
+            ax=ax,
+            color="#9ecae1",
+            edgecolor="#08519c",
+            linewidth=1.0,
+            alpha=0.45,
+            label="With train",
+        )
+        isochrones_no_train[threshold].plot(
+            ax=ax,
+            color="#fdae6b",
+            edgecolor="#e6550d",
+            linewidth=1.0,
+            alpha=0.45,
+            label="No train",
+        )
+        rail_nodes = access_nodes_with_train[access_nodes_with_train["access_type"].eq("rail_station")]
+        if not rail_nodes.empty:
+            rail_nodes.plot(ax=ax, color="#54278f", markersize=10, alpha=0.7)
+        ax.set_title(f"{threshold} minutes")
+        ax.set_axis_off()
+        ax.set_aspect("equal")
+    axes[0].legend(loc="lower left")
+    fig.suptitle("Kiyohara isochrones: no-train vs with-train")
+    fig.tight_layout()
+    fig.savefig(fig_path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+
+
 def run_analysis(args: argparse.Namespace) -> int:
     data_dir = Path(args.data_dir)
     out_dir = Path(args.output_dir)
@@ -914,6 +1164,8 @@ def run_analysis(args: argparse.Namespace) -> int:
     lrt_stops = read_layer(layers["lrt_stops"])
     bus_stops = read_layer(layers["bus_stops"]) if layers["bus_stops"] else None
     bus_routes = explode_lines(read_layer(layers["bus_routes"])) if layers["bus_routes"] else None
+    rail_lines = explode_lines(read_layer(layers["rail_lines"])) if layers["rail_lines"] else None
+    rail_stations = read_layer(layers["rail_stations"]) if layers["rail_stations"] else None
 
     lrt_name_col = first_existing_col(lrt_stops, NAME_CANDIDATES["lrt_stops"])
     lrt_stops = force_points(lrt_stops, lrt_name_col)
@@ -926,6 +1178,8 @@ def run_analysis(args: argparse.Namespace) -> int:
     analysis_area = destination.geometry.buffer(analysis_radius_m).envelope
     bus_stops = clip_to_polygon(bus_stops, analysis_area)
     bus_routes = clip_to_polygon(bus_routes, analysis_area)
+    rail_lines = clip_to_polygon(rail_lines, analysis_area)
+    rail_stations = clip_to_polygon(rail_stations, analysis_area)
 
     road_paths = layers["roads"] if isinstance(layers["roads"], list) else []
     roads = read_layers(road_paths)
@@ -937,32 +1191,56 @@ def run_analysis(args: argparse.Namespace) -> int:
         geometry="geometry",
         crs=CRS_ANALYSIS,
     )
-    access_nodes = prepare_access_nodes(lrt_with_times, bus_stops, bus_routes, destination_point, max_threshold)
-    access_nodes = access_nodes[access_nodes["total_transit_min"].le(max_threshold)].copy()
-    access_nodes["total_transit_min"] = access_nodes["total_transit_min"].round(3)
-    access_nodes["bus_min"] = pd.to_numeric(access_nodes["bus_min"], errors="coerce").round(3)
-    access_nodes["bus_wait_min"] = pd.to_numeric(access_nodes["bus_wait_min"], errors="coerce").round(3)
-    access_nodes["z_lrt_min"] = pd.to_numeric(access_nodes["z_lrt_min"], errors="coerce").round(3)
-    access_nodes["lrt_wait_min"] = pd.to_numeric(access_nodes["lrt_wait_min"], errors="coerce").round(3)
+    access_nodes_no_train = prepare_access_nodes(lrt_with_times, bus_stops, bus_routes, destination_point, max_threshold)
+    rail_access_nodes = estimate_rail_access(rail_stations, rail_lines, lrt_with_times, destination_point, max_threshold)
+    access_nodes_with_train = pd.concat([access_nodes_no_train, rail_access_nodes], ignore_index=True)
+    access_nodes_with_train = gpd.GeoDataFrame(access_nodes_with_train, geometry="geometry", crs=CRS_ANALYSIS)
 
-    if access_nodes.empty:
-        raise RuntimeError("No transit access nodes are reachable within the requested thresholds.")
+    numeric_cols = [
+        "total_transit_min",
+        "bus_min",
+        "bus_wait_min",
+        "rail_min",
+        "rail_wait_min",
+        "rail_lrt_transfer_walk_min",
+        "rail_destination_walk_min",
+        "z_lrt_min",
+        "lrt_wait_min",
+    ]
+    access_nodes_no_train = access_nodes_no_train[access_nodes_no_train["total_transit_min"].le(max_threshold)].copy()
+    access_nodes_with_train = access_nodes_with_train[access_nodes_with_train["total_transit_min"].le(max_threshold)].copy()
+    rail_access_nodes = rail_access_nodes[rail_access_nodes["total_transit_min"].le(max_threshold)].copy() if not rail_access_nodes.empty else rail_access_nodes
+    for frame in [access_nodes_no_train, access_nodes_with_train, rail_access_nodes]:
+        if frame is None or frame.empty:
+            continue
+        for col in numeric_cols:
+            if col in frame.columns:
+                frame[col] = pd.to_numeric(frame[col], errors="coerce").round(3)
 
-    isochrones = {}
-    for threshold in args.thresholds:
-        if roads is not None and not roads.empty and nx is not None:
-            isochrones[int(threshold)] = make_road_network_isochrone(access_nodes, roads, threshold)
-        else:
-            warnings.warn(
-                "Road network layer or networkx is unavailable; using fallback walking buffers for X minutes.",
-                stacklevel=2,
-            )
-            isochrones[int(threshold)] = make_fallback_isochrone(access_nodes, threshold)
+    if access_nodes_no_train.empty:
+        raise RuntimeError("No no-train transit access nodes are reachable within the requested thresholds.")
+    if access_nodes_with_train.empty:
+        raise RuntimeError("No with-train transit access nodes are reachable within the requested thresholds.")
 
-    write_outputs(out_dir, access_nodes, lrt_with_times, isochrones, bus_routes, roads)
-    for threshold, gdf in isochrones.items():
-        area_km2 = float(gdf.to_crs(CRS_ANALYSIS).area.sum()) / 1_000_000
-        log(f"{threshold:>2} min isochrone area: {area_km2:,.2f} km2 ({gdf.iloc[0]['method']})")
+    isochrones_no_train = make_isochrones(access_nodes_no_train, roads, args.thresholds)
+    isochrones_with_train = make_isochrones(access_nodes_with_train, roads, args.thresholds)
+
+    write_outputs(
+        out_dir,
+        access_nodes_no_train,
+        access_nodes_with_train,
+        rail_access_nodes,
+        lrt_with_times,
+        isochrones_no_train,
+        isochrones_with_train,
+        bus_routes,
+        rail_lines,
+        roads,
+    )
+    for scenario, layers_by_threshold in [("no-train", isochrones_no_train), ("with-train", isochrones_with_train)]:
+        for threshold, gdf in layers_by_threshold.items():
+            area_km2 = float(gdf.to_crs(CRS_ANALYSIS).area.sum()) / 1_000_000
+            log(f"{threshold:>2} min {scenario} isochrone area: {area_km2:,.2f} km2 ({gdf.iloc[0]['method']})")
     return 0
 
 
