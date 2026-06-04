@@ -1,3 +1,5 @@
+arcgis
+arcgis-mapping
 geopandas
 matplotlib
 networkx
